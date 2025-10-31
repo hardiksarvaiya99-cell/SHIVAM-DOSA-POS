@@ -1,0 +1,1029 @@
+import React, { useState, useEffect, useRef } from 'react';
+// --- FIX: Change Firebase imports from URL to package style ---
+import { initializeApp } from 'firebase/app';
+import {
+getFirestore, doc, setDoc, onSnapshot, collection,
+addDoc, deleteDoc, updateDoc, query, where, getDocs, Timestamp, setLogLevel
+} from 'firebase/firestore';
+import {
+getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged
+} from 'firebase/auth';
+// --- END FIX ---
+
+// --- Firebase Configuration ---
+// These global variables are provided by the environment.
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Initialize Firebase ---
+let db, auth;
+try {
+const app = initializeApp(firebaseConfig);
+db = getFirestore(app);
+auth = getAuth(app);
+// Enable debug logging for Firestore
+setLogLevel('debug');
+} catch (e) {
+console.error("Error initializing Firebase:", e);
+}
+
+// --- Constants ---
+const MENU_ITEMS = [
+{ id: 1, name: "Masala Dosa", price: 60, image: "https://placehold.co/100x100/FFF0E0/FF6347?text=Masala+Dosa" },
+{ id: 2, name: "Rava Dosa", price: 70, image: "https://placehold.co/100x100/FFF0E0/FF6347?text=Rava+Dosa" },
+{ id: 3, name: "Onion Uttapam", price: 80, image: "https://placehold.co/100x100/FFF0E0/FF6347?text=Onion+Uttapam" },
+{ id: 4, name: "Paneer Dosa", price: 90, image: "https://placehold.co/100x100/FFF0E0/FF6347?text=Paneer+Dosa" },
+{ id: 5, name: "Idli Sambar", price: 50, image: "https://placehold.co/100x100/FFF0E0/FF6347?text=Idli" },
+{ id: 6, name: "Vada Sambar", price: 55, image: "https://placehold.co/100x100/FFF0E0/FF6347?text=Vada" },
+];
+
+const COLLECTIONS = {
+ACTIVE_ORDERS: 'activeOrders',
+PENDING_ORDERS: 'pendingOrders'
+};
+
+// --- Helper Functions ---
+const formatCurrency = (amount) => {
+return new Intl.NumberFormat('en-IN', {
+style: 'currency',
+currency: 'INR',
+minimumFractionDigits: 0,
+maximumFractionDigits: 0,
+}).format(amount);
+};
+
+// --- Main Application Component ---
+export default function App() {
+// --- State Variables ---
+
+// App Mode:
+// 'splash': Initial loading screen (Staff or Customer)
+// 'pos': Staff Point-of-Sale interface
+// 'customer_entry': Customer enters their table number
+// 'customer_menu': Customer views menu and places order
+const [appMode, setAppMode] = useState('splash'); // Start at splash screen
+
+// Firebase state
+const [isAuthReady, setIsAuthReady] = useState(false);
+const [userId, setUserId] = useState(null);
+
+// POS state
+const [activeTab, setActiveTab] = useState('orders'); // 'orders' or 'qr'
+const [activeOrders, setActiveOrders] = useState([]);
+const [pendingOrders, setPendingOrders] = useState([]);
+const [selectedOrder, setSelectedOrder] = useState(null);
+const [isModalOpen, setIsModalOpen] = useState(false);
+const [isBillOpen, setIsBillOpen] = useState(false);
+
+// QR Generator state
+const [generatedQrCode, setGeneratedQrCode] = useState(null);
+const [qrError, setQrError] = useState('');
+
+// Customer state
+const [customerTableId, setCustomerTableId] = useState('');
+const [customerCart, setCustomerCart] = useState([]);
+const [customerError, setCustomerError] = useState('');
+const [isPlacingOrder, setIsPlacingOrder] = useState(false);
+const [orderSuccess, setOrderSuccess] = useState(false);
+
+const [isInitialized, setIsInitialized] = useState(false);
+
+// --- Firebase Authentication & Initialization ---
+useEffect(() => {
+if (!db || !auth) {
+console.error("Firebase services not initialized.");
+return;
+}
+
+const signIn = async () => {
+  try {
+    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+      await signInWithCustomToken(auth, __initial_auth_token);
+      console.log("Signed in with custom token.");
+    } else {
+      await signInAnonymously(auth);
+      console.log("Signed in anonymously.");
+    }
+  } catch (error) {
+    console.error("Error signing in:", error);
+  }
+};
+
+const unsubscribe = onAuthStateChanged(auth, (user) => {
+  if (user) {
+    const uid = user.uid;
+    console.log("User is authenticated. UID:", uid);
+    setUserId(uid);
+    setIsAuthReady(true);
+  } else {
+    console.log("User is not authenticated. Signing in...");
+    signIn();
+  }
+});
+
+return () => unsubscribe();
+
+
+}, []);
+
+// --- Firestore Data Listeners (Real-time) ---
+useEffect(() => {
+if (!isAuthReady || !db || appMode !== 'pos') {
+console.log(Firestore listener paused. AuthReady: ${isAuthReady}, AppMode: ${appMode});
+return;
+}
+
+console.log("Attaching Firestore listeners for POS mode.");
+
+// Path for private (user-specific) data
+const getPrivateCollectionPath = (collectionName) => {
+  if (!userId) {
+    console.error("User ID is not set.");
+    return null;
+  }
+  return `/artifacts/${appId}/users/${userId}/${collectionName}`;
+};
+
+const activeOrdersPath = getPrivateCollectionPath(COLLECTIONS.ACTIVE_ORDERS);
+const pendingOrdersPath = getPrivateCollectionPath(COLLECTIONS.PENDING_ORDERS);
+
+if (!activeOrdersPath || !pendingOrdersPath) {
+  console.error("Could not determine collection paths.");
+  return;
+}
+
+// Listener for Active Orders
+const qActive = query(collection(db, activeOrdersPath));
+const unsubscribeActive = onSnapshot(qActive, (snapshot) => {
+  const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  setActiveOrders(orders);
+}, (error) => {
+  console.error("Error listening to active orders:", error);
+});
+
+// Listener for Pending Orders
+const qPending = query(collection(db, pendingOrdersPath));
+const unsubscribePending = onSnapshot(qPending, (snapshot) => {
+  const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  setPendingOrders(orders);
+}, (error) => {
+  console.error("Error listening to pending orders:", error);
+});
+
+return () => {
+  console.log("Detaching Firestore listeners.");
+  unsubscribeActive();
+  unsubscribePending();
+};
+
+
+}, [isAuthReady, userId, appMode]); // Re-run when auth is ready or app mode changes
+
+// --- Helper: Get Firestore Collection Path ---
+const getCollectionPath = (collectionName) => {
+if (!userId) {
+console.error("User ID is not set. Cannot get collection path.");
+return null;
+}
+// Use private path by default
+return /artifacts/${appId}/users/${userId}/${collectionName};
+};
+
+// --- POS (Staff) Functions ---
+
+const handleCreateOrder = () => {
+setSelectedOrder({
+tableId: '',
+items: [],
+total: 0,
+createdAt: new Date().toISOString(),
+status: 'active'
+});
+setIsModalOpen(true);
+};
+
+const handleEditOrder = (order) => {
+setSelectedOrder(order);
+setIsModalOpen(true);
+};
+
+const handleCloseModal = () => {
+setIsModalOpen(false);
+setSelectedOrder(null);
+};
+
+const handleSaveOrder = async () => {
+if (!db) {
+console.error("Firestore DB is not initialized.");
+return;
+}
+if (!selectedOrder) return;
+
+const collectionPath = getCollectionPath(COLLECTIONS.ACTIVE_ORDERS);
+if (!collectionPath) return;
+
+try {
+  if (selectedOrder.id) {
+    // Update existing order
+    const docRef = doc(db, collectionPath, selectedOrder.id);
+    await updateDoc(docRef, selectedOrder);
+  } else {
+    // Create new order
+    await addDoc(collection(db, collectionPath), {
+      ...selectedOrder,
+      createdAt: Timestamp.now() // Use Firestore Timestamp
+    });
+  }
+  handleCloseModal();
+} catch (error) {
+  console.error("Error saving order:", error);
+}
+
+
+};
+
+const handleAddItemToOrder = (item) => {
+if (!selectedOrder) return;
+
+setSelectedOrder(prevOrder => {
+  const existingItem = prevOrder.items.find(i => i.id === item.id);
+  let newItems;
+  if (existingItem) {
+    newItems = prevOrder.items.map(i =>
+      i.id === item.id ? { ...i, quantity: i.quantity + 1 } : i
+    );
+  } else {
+    newItems = [...prevOrder.items, { ...item, quantity: 1 }];
+  }
+  const newTotal = newItems.reduce((sum, i) => sum + (i.price * i.quantity), 0);
+  return { ...prevOrder, items: newItems, total: newTotal };
+});
+
+
+};
+
+const handleRemoveItemFromOrder = (itemId) => {
+if (!selectedOrder) return;
+
+setSelectedOrder(prevOrder => {
+  const newItems = prevOrder.items
+    .map(i => {
+      if (i.id === itemId) {
+        return { ...i, quantity: i.quantity - 1 };
+      }
+      return i;
+    })
+    .filter(i => i.quantity > 0);
+  
+  const newTotal = newItems.reduce((sum, i) => sum + (i.price * i.quantity), 0);
+  return { ...prevOrder, items: newItems, total: newTotal };
+});
+
+
+};
+
+const handleShowBill = (order) => {
+setSelectedOrder(order);
+setIsBillOpen(true);
+};
+
+const handleMarkAsPaid = async (orderId) => {
+if (!db) {
+console.error("Firestore DB is not initialized.");
+return;
+}
+const collectionPath = getCollectionPath(COLLECTIONS.ACTIVE_ORDERS);
+if (!collectionPath) return;
+
+try {
+  const docRef = doc(db, collectionPath, orderId);
+  await deleteDoc(docRef); // Delete the order
+  setIsBillOpen(false);
+  setSelectedOrder(null);
+} catch (error) {
+  console.error("Error marking as paid:", error);
+}
+
+
+};
+
+// --- Pending Order Functions (Staff) ---
+
+const handleAcceptOrder = async (pendingOrder) => {
+if (!db) {
+console.error("Firestore DB is not initialized.");
+return;
+}
+
+const activeCollectionPath = getCollectionPath(COLLECTIONS.ACTIVE_ORDERS);
+const pendingCollectionPath = getCollectionPath(COLLECTIONS.PENDING_ORDERS);
+if (!activeCollectionPath || !pendingCollectionPath) return;
+
+try {
+  // 1. Add to active orders
+  await addDoc(collection(db, activeCollectionPath), {
+    tableId: pendingOrder.tableId,
+    items: pendingOrder.items,
+    total: pendingOrder.total,
+    createdAt: pendingOrder.createdAt || Timestamp.now(),
+    status: 'active'
+  });
+  
+  // 2. Remove from pending orders
+  const docRef = doc(db, pendingCollectionPath, pendingOrder.id);
+  await deleteDoc(docRef);
+  
+} catch (error) {
+  console.error("Error accepting order:", error);
+}
+
+
+};
+
+const handleRejectOrder = async (orderId) => {
+if (!db) {
+console.error("Firestore DB is not initialized.");
+return;
+}
+const collectionPath = getCollectionPath(COLLECTIONS.PENDING_ORDERS);
+if (!collectionPath) return;
+
+try {
+  const docRef = doc(db, collectionPath, orderId);
+  await deleteDoc(docRef);
+} catch (error) {
+  console.error("Error rejecting order:", error);
+}
+
+
+};
+
+// --- QR Code Generator Function (Staff) ---
+
+const handleGenerateQr = () => {
+setQrError('');
+
+// --- FINAL FIX: Use window.location.href ---
+// This is the only reliable way to get the *full, correct, visitable URL*
+// from inside the preview iframe.
+
+// 1. Get the full, current URL
+let baseUrl = window.location.href;
+
+// 2. Remove any existing query string or hash,
+//    so we have a clean base URL
+baseUrl = baseUrl.split('?')[0].split('#')[0];
+
+// 3. This 'baseUrl' is the address of the app itself.
+const customerUrl = `${baseUrl}`;
+
+console.log("Generating QR Code with this URL:", customerUrl);
+
+// Add cache-buster 't' to ensure a new QR image is generated
+const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(customerUrl)}&t=${new Date().getTime()}`;
+setGeneratedQrCode(qrCodeUrl);
+
+
+};
+
+// --- Customer Functions ---
+
+const handleCustomerTableSubmit = (e) => {
+e.preventDefault();
+if (!customerTableId.trim()) {
+setCustomerError("Please enter a table number.");
+return;
+}
+setCustomerError('');
+setAppMode('customer_menu'); // Move to menu
+};
+
+const handleAddToCart = (item) => {
+setCustomerCart(prevCart => {
+const existingItem = prevCart.find(i => i.id === item.id);
+if (existingItem) {
+return prevCart.map(i =>
+i.id === item.id ? { ...i, quantity: i.quantity + 1 } : i
+);
+} else {
+return [...prevCart, { ...item, quantity: 1 }];
+}
+});
+};
+
+const handleRemoveFromCart = (item) => {
+setCustomerCart(prevCart => {
+const existingItem = prevCart.find(i => i.id === item.id);
+if (existingItem && existingItem.quantity > 1) {
+return prevCart.map(i =>
+i.id === item.id ? { ...i, quantity: i.quantity - 1 } : i
+);
+} else {
+return prevCart.filter(i => i.id !== item.id);
+}
+});
+};
+
+const handlePlaceOrder = async () => {
+if (!db) {
+console.error("Firestore DB is not initialized.");
+setCustomerError("Cannot connect to server. Please try again.");
+return;
+}
+if (customerCart.length === 0) {
+setCustomerError("Your cart is empty.");
+return;
+}
+
+// This is a safety check. In a real app, the customer
+// might not be authenticated, so we need a public path.
+// For this demo, we'll assume the customer can write to the *staff's*
+// pending orders, which requires careful security rules.
+// For this user ID-based demo, we'll use the staff's (owner's) path.
+const collectionPath = getCollectionPath(COLLECTIONS.PENDING_ORDERS);
+if (!collectionPath) {
+  setCustomerError("Could not find order destination. Please contact staff.");
+  return;
+}
+
+setIsPlacingOrder(true);
+setCustomerError('');
+
+try {
+  const total = customerCart.reduce((sum, i) => sum + (i.price * i.quantity), 0);
+  
+  await addDoc(collection(db, collectionPath), {
+    tableId: customerTableId,
+    items: customerCart,
+    total: total,
+    createdAt: Timestamp.now(),
+    status: 'pending'
+  });
+  
+  setOrderSuccess(true);
+  setCustomerCart([]);
+  // Don't reset table ID, they might want to order more
+} catch (error) {
+  console.error("Error placing order:", error);
+  setCustomerError("Could not place order. Please show this to staff.");
+} finally {
+  setIsPlacingOrder(false);
+}
+
+
+};
+
+// --- Render Functions ---
+
+// Render: Splash Screen (Entry Point)
+const renderSplash = () => {
+return (
+<div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
+<div className="w-full max-w-md bg-white rounded-lg shadow-xl p-8 text-center">
+<h1 className="text-3xl font-bold text-blue-600 mb-4">
+Welcome to Shivam Dosa
+</h1>
+<p className="text-gray-600 mb-8">
+Please select your role:
+</p>
+<div className="flex flex-col space-y-4">
+<button
+onClick={() => setAppMode('pos')}
+className="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-4 rounded-lg shadow-lg transition duration-200 text-lg"
+>
+Staff Login
+</button>
+<button
+onClick={() => setAppMode('customer_entry')}
+className="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-4 rounded-lg shadow-lg transition duration-200 text-lg"
+>
+Start Customer Order
+</button>
+</div>
+</div>
+</div>
+);
+};
+
+// Render: Customer Table Entry
+const renderCustomerEntry = () => {
+return (
+<div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
+<div className="w-full max-w-md bg-white rounded-lg shadow-xl p-8 text-center">
+<h1 className="text-3xl font-bold text-blue-600 mb-4">
+Welcome to Shivam Dosa
+</h1>
+<form onSubmit={handleCustomerTableSubmit} className="flex flex-col">
+<label htmlFor="tableId" className="text-lg text-gray-700 mb-2">
+Please enter your Table Number
+</label>
+<input
+id="tableId"
+type="text"
+value={customerTableId}
+onChange={(e) => setCustomerTableId(e.target.value)}
+className="border-2 border-gray-300 rounded-lg p-3 text-lg text-center focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+placeholder="e.g., 5 or 12A"
+/>
+{customerError && (
+<p className="text-red-500 mt-2">{customerError}</p>
+)}
+<button
+type="submit"
+className="mt-6 w-full bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-4 rounded-lg shadow-lg transition duration-200 text-lg"
+>
+Start Order
+</button>
+</form>
+<button
+onClick={() => setAppMode('splash')}
+className="mt-4 text-gray-500 hover:text-gray-700"
+>
+← Back
+</button>
+</div>
+</div>
+);
+};
+
+// Render: Customer Menu
+const renderCustomerMenu = () => {
+if (orderSuccess) {
+return (
+<div className="flex flex-col items-center justify-center min-h-screen bg-green-50 p-4 text-center">
+<div className="bg-white p-8 rounded-lg shadow-xl">
+<h2 className="text-3xl font-bold text-green-600 mb-4">
+Order Placed!
+</h2>
+<p className="text-lg text-gray-700 mb-6">
+Your order for Table <span className="font-bold">{customerTableId}</span> has been sent to the kitchen.
+</p>
+<button
+onClick={() => setOrderSuccess(false)}
+className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-6 rounded-lg shadow-lg"
+>
+Order More
+</button>
+</div>
+</div>
+);
+}
+
+const cartTotal = customerCart.reduce((sum, i) => sum + (i.price * i.quantity), 0);
+
+return (
+  <div className="min-h-screen bg-gray-50">
+    <header className="bg-blue-600 text-white p-4 shadow-md sticky top-0 z-10">
+      <div className="container mx-auto max-w-4xl flex justify-between items-center">
+        <div>
+          <h1 className="text-2xl font-bold">Shivam Dosa</h1>
+          <p className="text-sm">Table: <span className="font-semibold">{customerTableId}</span></p>
+        </div>
+        <button onClick={() => setAppMode('customer_entry')} className="text-sm">
+          &larr; Change Table
+        </button>
+      </div>
+    </header>
+    
+    <main className="container mx-auto max-w-4xl p-4 pb-40">
+      <h2 className="text-2xl font-semibold text-gray-800 mb-4">Our Menu</h2>
+      
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {MENU_ITEMS.map(item => (
+          <div key={item.id} className="bg-white rounded-lg shadow-md overflow-hidden flex">
+            <img 
+              src={item.image} 
+              alt={item.name} 
+              className="w-24 h-24 object-cover flex-shrink-0"
+              onError={(e) => { e.target.src = 'https://placehold.co/100x100/CCCCCC/FFFFFF?text=Image'; }}
+            />
+            <div className="p-4 flex flex-col justify-between w-full">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">{item.name}</h3>
+                <p className="text-gray-600">{formatCurrency(item.price)}</p>
+              </div>
+              <div className="self-end">
+                <button
+                  onClick={() => handleAddToCart(item)}
+                  className="bg-green-500 hover:bg-green-600 text-white font-bold py-1 px-3 rounded-lg shadow"
+                >
+                  + Add
+                </button>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </main>
+    
+    {/* --- Customer Cart --- */}
+    {customerCart.length > 0 && (
+      <footer className="fixed bottom-0 left-0 w-full bg-white shadow-inner-top p-4 border-t-2 border-blue-500">
+        <div className="container mx-auto max-w-4xl">
+          <h3 className="text-xl font-bold mb-2">Your Order</h3>
+          {customerError && (
+            <p className="text-red-500 mb-2">{customerError}</p>
+          )}
+          <div className="max-h-32 overflow-y-auto mb-2">
+            {customerCart.map(item => (
+              <div key={item.id} className="flex justify-between items-center mb-1">
+                <span className="text-gray-700">{item.name}</span>
+                <div className="flex items-center space-x-2">
+                  <button
+                    onClick={() => handleRemoveFromCart(item)}
+                    className="bg-red-200 text-red-700 w-6 h-6 rounded-full font-bold"
+                  >
+                    -
+                  </button>
+                  <span className="font-semibold">{item.quantity}</span>
+                  <button
+                    onClick={() => handleAddToCart(item)}
+                    className="bg-green-200 text-green-700 w-6 h-6 rounded-full font-bold"
+                  >
+                    +
+                  </button>
+                  <span className="w-16 text-right">{formatCurrency(item.price * item.quantity)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="flex justify-between items-center border-t pt-2">
+            <span className="text-xl font-bold">Total: {formatCurrency(cartTotal)}</span>
+            <button
+              onClick={handlePlaceOrder}
+              disabled={isPlacingOrder}
+              className={`bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-6 rounded-lg shadow-lg ${isPlacingOrder ? 'opacity-50 cursor-not-allowed' : ''}`}
+            >
+              {isPlacingOrder ? "Placing..." : "Place Order"}
+            </button>
+          </div>
+        </div>
+      </footer>
+    )}
+  </div>
+);
+
+
+};
+
+// Render: POS (Staff Interface)
+const renderPos = () => {
+return (
+<div className="flex h-screen bg-gray-100">
+{/* --- Main Content --- */}
+<main className="flex-1 p-6 overflow-auto">
+<header className="flex justify-between items-center mb-6">
+<h1 className="text-3xl font-bold text-gray-800">
+Shivam Dosa (POS)
+</h1>
+<div>
+<span className="text-sm text-gray-500 mr-4">
+User: {userId ? ${userId.substring(0, 8)}... : 'Connecting...'}
+</span>
+<button
+onClick={() => setAppMode('splash')}
+className="text-blue-500 hover:text-blue-700"
+>
+← Logout (Back to Splash)
+</button>
+</div>
+</header>
+
+      {/* --- Navigation Tabs --- */}
+      <div className="mb-6 border-b border-gray-300">
+        <nav className="-mb-px flex space-x-8">
+          <button
+            onClick={() => setActiveTab('orders')}
+            className={`py-4 px-1 border-b-2 font-medium text-lg ${
+              activeTab === 'orders'
+                ? 'border-blue-500 text-blue-600'
+                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+            }`}
+          >
+            Orders
+          </button>
+          <button
+            onClick={() => setActiveTab('qr')}
+            className={`py-4 px-1 border-b-2 font-medium text-lg ${
+              activeTab === 'qr'
+                ? 'border-blue-500 text-blue-600'
+                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+            }`}
+          >
+            Table QR Management
+          </button>
+        </nav>
+      </div>
+
+      {/* --- Tab Content --- */}
+      {activeTab === 'orders' ? (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* --- Pending Orders --- */}
+          <section>
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-2xl font-semibold text-gray-700">
+                Pending Orders
+              </h2>
+              <span className="bg-red-500 text-white text-sm font-bold w-6 h-6 flex items-center justify-center rounded-full">
+                {pendingOrders.length}
+              </span>
+            </div>
+            <div className="bg-white rounded-lg shadow-md p-4 space-y-4">
+              {pendingOrders.length === 0 ? (
+                <p className="text-gray-500">No new pending orders.</p>
+              ) : (
+                pendingOrders.map(order => (
+                  <div key={order.id} className="border rounded-lg p-4 bg-yellow-50">
+                    <h3 className="text-lg font-bold">Table: {order.tableId}</h3>
+                    <p className="text-sm text-gray-600">
+                      {new Date(order.createdAt?.seconds * 1000).toLocaleTimeString()}
+                    </p>
+                    <ul className="mt-2 space-y-1">
+                      {order.items.map(item => (
+                        <li key={item.id} className="flex justify-between">
+                          <span>{item.quantity} x {item.name}</span>
+                          <span>{formatCurrency(item.price * item.quantity)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="border-t mt-2 pt-2 flex justify-between font-bold">
+                      <span>Total</span>
+                      <span>{formatCurrency(order.total)}</span>
+                    </div>
+                    <div className="flex space-x-2 mt-4">
+                      <button
+                        onClick={() => handleAcceptOrder(order)}
+                        className="flex-1 bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        onClick={() => handleRejectOrder(order.id)}
+                        className="flex-1 bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </section>
+
+          {/* --- Active Orders --- */}
+          <section>
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-2xl font-semibold text-gray-700">
+                Active Orders
+              </h2>
+              <button
+                onClick={handleCreateOrder}
+                className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg shadow"
+              >
+                + New Order (Staff)
+              </button>
+            </div>
+            <div className="bg-white rounded-lg shadow-md p-4 space-y-4">
+              {activeOrders.length === 0 ? (
+                <p className="text-gray-500">No active orders. Click "New Order" to get started.</p>
+              ) : (
+                activeOrders.map(order => (
+                  <div key={order.id} className="border rounded-lg p-4">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <h3 className="text-lg font-bold">Table: {order.tableId}</h3>
+                        <p className="text-sm text-gray-600">
+                          {new Date(order.createdAt?.seconds * 1000).toLocaleTimeString()}
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-lg font-bold">{formatCurrency(order.total)}</p>
+                        <p className="text-sm text-gray-500">{order.items.length} items</p>
+                      </div>
+                    </div>
+                    <div className="flex space-x-2 mt-4">
+                      <button
+                        onClick={() => handleEditOrder(order)}
+                        className="flex-1 bg-yellow-500 hover:bg-yellow-600 text-white font-bold py-2 px-4 rounded-lg"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        onClick={() => handleShowBill(order)}
+                        className="flex-1 bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg"
+                      >
+                        View Bill
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </section>
+        </div>
+      ) : (
+        // --- QR Management Tab ---
+        <section>
+          <h2 className="text-2xl font-semibold text-gray-700 mb-4">
+            Generate Customer QR Code
+          </h2>
+          <div className="bg-white rounded-lg shadow-md p-6 max-w-md">
+            <p className="text-gray-600 mb-4">
+              Generate a single QR code for all your tables. When customers
+              scan this, they will see the "Start Customer Order" button.
+            </p>
+            <button
+              onClick={handleGenerateQr}
+              className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg shadow"
+            >
+              Generate General Menu QR Code
+            </button>
+            
+            {qrError && (
+              <p className="text-red-500 mt-4">{qrError}</p>
+            )}
+            
+            {generatedQrCode && (
+              <div className="mt-6 text-center">
+                <p className="font-semibold mb-2">Scan this QR Code</p>
+                <img
+                  src={generatedQrCode}
+                  alt="Generated QR Code"
+                  className="w-64 h-64 mx-auto border-4 border-gray-300 rounded-lg"
+                />
+                <p className="text-sm text-gray-500 mt-2">
+                  Print this and place it on all tables.
+                </p>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+    </main>
+    
+    {/* --- Order Edit Modal --- */}
+    {isModalOpen && selectedOrder && (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-20 p-4">
+        <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[90vh] flex flex-col">
+          <header className="flex justify-between items-center p-4 border-b">
+            <h2 className="text-2xl font-bold">
+              {selectedOrder.id ? 'Edit Order' : 'Create Order'}
+            </h2>
+            <button onClick={handleCloseModal} className="text-2xl">&times;</button>
+          </header>
+          
+          <div className="flex-1 flex overflow-hidden">
+            {/* --- Menu --- */}
+            <div className="w-1/2 p-4 border-r overflow-y-auto">
+              <h3 className="text-xl font-semibold mb-4">Menu</h3>
+              <div className="space-y-2">
+                {MENU_ITEMS.map(item => (
+                  <div key={item.id} className="flex justify-between items-center p-2 border rounded-lg">
+                    <div>
+                      <p className="font-bold">{item.name}</p>
+                      <p className="text-sm">{formatCurrency(item.price)}</p>
+                    </div>
+                    <button
+                      onClick={() => handleAddItemToOrder(item)}
+                      className="bg-green-500 hover:bg-green-600 text-white font-bold w-8 h-8 rounded-full"
+                    >
+                      +
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+            
+            {/* --- Current Order --- */}
+            <div className="w-1/2 p-4 flex flex-col overflow-y-auto">
+              <h3 className="text-xl font-semibold mb-4">Current Order</h3>
+              <div className="mb-4">
+                <label htmlFor="tableId" className="block text-sm font-medium text-gray-700">
+                  Table Number
+                </label>
+                <input
+                  type="text"
+                  id="tableId"
+                  value={selectedOrder.tableId}
+                  onChange={(e) => setSelectedOrder(prev => ({ ...prev, tableId: e.target.value }))}
+                  className="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"
+                />
+              </div>
+              
+              <div className="flex-1 space-y-2 overflow-y-auto">
+                {selectedOrder.items.length === 0 ? (
+                  <p className="text-gray-500">No items added yet.</p>
+                ) : (
+                  selectedOrder.items.map(item => (
+                    <div key={item.id} className="flex justify-between items-center p-2 border rounded-lg">
+                      <div>
+                        <p className="font-bold">{item.name}</p>
+                        <p className="text-sm">
+                          {formatCurrency(item.price)} x {item.quantity} = {formatCurrency(item.price * item.quantity)}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => handleRemoveItemFromOrder(item.id)}
+                        className="bg-red-500 hover:bg-red-600 text-white font-bold w-8 h-8 rounded-full"
+                      >
+                        -
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+              
+              <div className="border-t pt-4 mt-4">
+                <p className="text-2xl font-bold text-right mb-4">
+                  Total: {formatCurrency(selectedOrder.total)}
+                </p>
+              </div>
+            </div>
+          </div>
+          
+          <footer className="p-4 border-t bg-gray-50 flex justify-end space-x-2">
+            <button
+              onClick={handleCloseModal}
+              className="bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-2 px-4 rounded-lg"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSaveOrder}
+              className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg"
+            >
+              Save Order
+            </button>
+          </footer>
+        </div>
+      </div>
+    )}
+    
+    {/* --- Bill Modal --- */}
+    {isBillOpen && selectedOrder && (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex justify-center items-center z-20 p-4">
+        <div className="bg-white rounded-lg shadow-xl w-full max-w-md">
+          <header className="flex justify-between items-center p-4 border-b">
+            <h2 className="text-2xl font-bold">Bill</h2>
+            <button onClick={() => setIsBillOpen(false)} className="text-2xl">&times;</button>
+          </header>
+          <div className="p-6">
+            <h3 className="text-xl font-bold text-center mb-2">Shivam Dosa</h3>
+            <p className="text-center text-sm text-gray-500 mb-4">Final Bill</p>
+            <p className="text-lg font-semibold mb-4">
+              Table: {selectedOrder.tableId}
+            </p>
+            <div className="space-y-2 max-h-64 overflow-y-auto border-b pb-2 mb-2">
+              {selectedOrder.items.map(item => (
+                <div key={item.id} className="flex justify-between">
+                  <span>{item.quantity} x {item.name}</span>
+                  <span>{formatCurrency(item.price * item.quantity)}</span>
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-between text-2xl font-bold mt-4">
+              <span>Total Due</span>
+              <span>{formatCurrency(selectedOrder.total)}</span>
+            </div>
+          </div>
+          <footer className="p-4 border-t bg-gray-50 flex justify-end">
+            <button
+              onClick={() => handleMarkAsPaid(selectedOrder.id)}
+              className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-6 rounded-lg shadow"
+            >
+              Mark as Paid
+            </button>
+          </footer>
+        </div>
+      </div>
+    )}
+  </div>
+);
+
+
+};
+
+// --- Main Render Logic ---
+
+if (!isAuthReady) {
+return (
+<div className="flex items-center justify-center min-h-screen">
+<div className="text-xl font-semibold">Connecting to server...</div>
+</div>
+);
+}
+
+switch (appMode) {
+case 'splash':
+return renderSplash();
+case 'pos':
+return renderPos();
+case 'customer_entry':
+return renderCustomerEntry();
+case 'customer_menu':
+return renderCustomerMenu();
+default:
+// Fallback to splash screen if mode is unknown
+return renderSplash();
+}
+}
